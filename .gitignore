@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Secrets — never commit these
+.env
+*.env
+credentials.json
+token.json
+service_account.json
+
+# Local test artefacts
+test_output.xlsx
+*BACKUP*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
