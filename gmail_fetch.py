@@ -143,35 +143,37 @@ def fetch_reports_gmail(target_date: date = None) -> dict:
 
     reports = {}
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
+    # NOTE: use mkdtemp (not TemporaryDirectory context manager) so the downloaded
+    # PDFs persist for the rest of the pipeline run. The OS cleans up /var/folders
+    # /tmp automatically.
+    tmp_path = Path(tempfile.mkdtemp(prefix="report_extractor_"))
 
-        for store in config.STORES:
-            sender = store["sender"]
-            tab    = store["tab"]
+    for store in config.STORES:
+        sender = store["sender"]
+        tab    = store["tab"]
 
-            query = f"from:{sender} after:{after_str} has:attachment filename:pdf"
-            messages = _search_messages(query)
+        query = f"from:{sender} after:{after_str} has:attachment filename:pdf"
+        messages = _search_messages(query)
 
-            if not messages:
-                print(f"  [WARN] No emails found for {store['name']} ({sender})")
-                continue
+        if not messages:
+            print(f"  [WARN] No emails found for {store['name']} ({sender})")
+            continue
 
-            store_reports = {}
-            # Use the most recent matching message
-            latest_msg = messages[0]
-            pdfs = _download_attachments(latest_msg["id"], tmp_path)
+        store_reports = {}
+        # Use the most recent matching message
+        latest_msg = messages[0]
+        pdfs = _download_attachments(latest_msg["id"], tmp_path)
 
-            for pdf in pdfs:
-                report_type = _identify_report_type(pdf.name)
-                if report_type:
-                    store_reports[report_type] = str(pdf)
+        for pdf in pdfs:
+            report_type = _identify_report_type(pdf.name)
+            if report_type:
+                store_reports[report_type] = str(pdf)
 
-            if store_reports:
-                reports[tab] = store_reports
-                print(f"  [GMAIL] {store['name']}: {list(store_reports.keys())}")
-            else:
-                print(f"  [WARN] No recognised PDFs for {store['name']}")
+        if store_reports:
+            reports[tab] = store_reports
+            print(f"  [GMAIL] {store['name']}: {list(store_reports.keys())}")
+        else:
+            print(f"  [WARN] No recognised PDFs for {store['name']}")
 
     return reports
 

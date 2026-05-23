@@ -1,0 +1,48 @@
+name: Daily Report Extractor
+
+on:
+  # Runs every morning at 6:00 AM Perth time (UTC+8 → 22:00 UTC the previous day).
+  schedule:
+    - cron: '0 22 * * *'
+
+  # Allow manual triggers from the Actions tab with an optional date override.
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: 'Target date in YYYY-MM-DD (leave blank for yesterday)'
+        required: false
+        default: ''
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          GMAIL_OAUTH_CREDENTIALS:       ${{ secrets.GMAIL_OAUTH_CREDENTIALS }}
+          GMAIL_TOKEN:                   ${{ secrets.GMAIL_TOKEN }}
+          GOOGLE_SHEETS_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SHEETS_SERVICE_ACCOUNT }}
+          SCORECARD_SHEET_ID:            ${{ secrets.SCORECARD_SHEET_ID }}
+          ALERT_EMAIL:                   ${{ secrets.ALERT_EMAIL }}
+          SMTP_USER:                     ${{ secrets.SMTP_USER }}
+          SMTP_PASS:                     ${{ secrets.SMTP_PASS }}
+        run: |
+          if [ -n "${{ github.event.inputs.target_date }}" ]; then
+            python main.py "${{ github.event.inputs.target_date }}"
+          else
+            python main.py
+          fi

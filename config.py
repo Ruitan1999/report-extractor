@@ -12,7 +12,7 @@ STORES = [
     {
         "name": "William St",
         "tab": "William St",
-        "sender": "williamst@mcdonalds.example.com",  # TBC
+        "sender": "ruitanhuang@outlook.com",  # TEST
     },
     {
         "name": "Hay St",

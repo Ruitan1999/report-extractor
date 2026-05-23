@@ -17,6 +17,10 @@ env/
 credentials.json
 token.json
 service_account.json
+gmail_token.json
+client_secret_*.json
+*-service-account*.json
+report-extractor-*.json
 
 # Local test artefacts
 test_output.xlsx

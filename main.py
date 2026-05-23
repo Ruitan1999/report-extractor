@@ -112,6 +112,34 @@ def run(target_date: date = None):
             alerter.record_issue(name, "sheets", f"Write failed: {e}")
             print(f"  [ERROR] Write failed: {e}")
 
+        # If this is a Sunday, also write a 'Week ending D/M/YY' summary row
+        # containing the DDCR Week Total column + Sales Ledger Week Tot row
+        if target_date.weekday() == 6:  # Monday=0 ... Sunday=6
+            try:
+                wt_row = {}
+                wt_ddcr = pdf_extractor.extract_ddcr(ddcr_path, 'Week Total')
+                wt_row.update(pdf_extractor.ddcr_to_scorecard_row(wt_ddcr))
+
+                if ledger_path:
+                    try:
+                        wt_row.update(pdf_extractor.extract_sales_ledger(
+                            ledger_path, target_date.day, week_total=True,
+                        ))
+                    except Exception as e:
+                        alerter.record_issue(name, "sales_ledger_weekly", str(e))
+
+                if qcr_path:
+                    try:
+                        wt_row.update(pdf_extractor.extract_qcr_daily(qcr_path))
+                    except Exception as e:
+                        alerter.record_issue(name, "qcr_daily_weekly", str(e))
+
+                wt_action = sheets_writer.write_weekly_summary_row(tab, target_date, wt_row)
+                print(f"  Weekly:    {wt_action}")
+            except Exception as e:
+                alerter.record_issue(name, "sheets_weekly", f"Weekly write failed: {e}")
+                print(f"  [ERROR] Weekly write failed: {e}")
+
     # ── Step 4: Alert digest ──────────────────────────────────────────────
     print(f"\n{'='*60}")
     alerter.send_digest(target_date)

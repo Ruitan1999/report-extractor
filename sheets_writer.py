@@ -56,14 +56,33 @@ def normalise_date(d: date) -> str:
     return f"{d.day}/{d.month}/{str(d.year)[2:]}"
 
 
+# Label used in column B for the weekly summary row that follows each Sunday
+WEEKLY_LABEL_PREFIX = "Week ending "
+
+
+def _is_weekly_summary_row(cell_value) -> bool:
+    """True if this cell is the 'Week ending D/M/YY' summary row label."""
+    if cell_value is None:
+        return False
+    return str(cell_value).strip().startswith(WEEKLY_LABEL_PREFIX)
+
+
 def _cell_matches_date(cell_value, target: date) -> bool:
     """
     Return True if the cell value represents the same date as target.
     Handles:
       - Python date / datetime objects (from openpyxl)
       - Text strings: 'D/M/YY', 'DD/MM/YY', 'D/M/YYYY'
+
+    'Week ending D/M/YY' rows are NEVER matched here — they have a separate
+    finder so daily writes don't accidentally overwrite weekly summary rows.
     """
     if cell_value is None:
+        return False
+
+    # Skip the weekly summary rows — they have their own date but represent
+    # weekly totals, not a daily row
+    if _is_weekly_summary_row(cell_value):
         return False
 
     if isinstance(cell_value, (datetime, date)):
@@ -327,6 +346,169 @@ def write_row(store_tab: str, target_date: date, row_data: dict, output_path: Pa
         return write_row_google(store_tab, target_date, row_data)
     else:
         return write_row_local(store_tab, target_date, row_data, output_path=output_path)
+
+
+# ---------------------------------------------------------------------------
+# Weekly summary row — inserts/overwrites a "Week ending D/M/YY" row
+# immediately after the matching Sunday daily row.
+# ---------------------------------------------------------------------------
+
+def _weekly_label(sunday_date: date) -> str:
+    return f"{WEEKLY_LABEL_PREFIX}{normalise_date(sunday_date)}"
+
+
+def _plan_weekly_row(date_col_values: list, sunday_date: date) -> dict:
+    """
+    Decide where the 'Week ending D/M/YY' row should go.
+
+    Strategy:
+      1. If a matching weekly summary row already exists → overwrite it.
+      2. Otherwise find the Sunday daily row → insert immediately after it.
+      3. If no Sunday daily row exists → fall back to insert-before-Monthend.
+    """
+    target_label = _weekly_label(sunday_date)
+    sunday_row = None
+    monthend_row = None
+
+    for idx, val in date_col_values:
+        # Already present? Overwrite it.
+        if val is not None and str(val).strip() == target_label:
+            return {"action": "overwrite", "row_index": idx}
+        # Track the Sunday daily row (needed for insert-after position)
+        if _cell_matches_date(val, sunday_date):
+            sunday_row = idx
+        if _is_month_end_row(val):
+            monthend_row = idx
+
+    if sunday_row is not None:
+        # Insert immediately AFTER the Sunday daily row
+        return {"action": "insert", "row_index": sunday_row + 1}
+
+    if monthend_row is not None:
+        return {"action": "insert", "row_index": monthend_row}
+
+    last_data = max(
+        (idx for idx, val in date_col_values if val is not None and not _is_target_row(val)),
+        default=config.DATA_START_ROW - 1,
+    )
+    return {"action": "append", "row_index": last_data + 1}
+
+
+def write_weekly_summary_row_local(
+    store_tab: str,
+    sunday_date: date,
+    row_data: dict,
+    xlsx_path: Path = LOCAL_XLSX,
+    output_path: Path = None,
+) -> str:
+    if output_path is None:
+        output_path = xlsx_path
+
+    wb = openpyxl.load_workbook(xlsx_path)
+    if store_tab not in wb.sheetnames:
+        raise ValueError(f"Sheet tab '{store_tab}' not found. Available: {wb.sheetnames}")
+
+    ws = wb[store_tab]
+    date_col = config.DATE_COL_INDEX + 1
+
+    date_col_values = []
+    for row in ws.iter_rows(
+        min_row=config.DATA_START_ROW,
+        max_row=ws.max_row,
+        min_col=date_col,
+        max_col=date_col,
+    ):
+        cell = row[0]
+        date_col_values.append((cell.row - 1, cell.value))
+
+    plan = _plan_weekly_row(date_col_values, sunday_date)
+    label = _weekly_label(sunday_date)
+    values = _row_data_to_list(row_data, label)
+
+    excel_row = plan["row_index"] + 1
+
+    if plan["action"] == "overwrite":
+        for col_idx, val in enumerate(values, start=1):
+            ws.cell(row=excel_row, column=col_idx, value=val)
+        action_desc = f"Overwrote weekly row {excel_row}"
+    else:
+        if plan["action"] == "insert":
+            ws.insert_rows(excel_row)
+        for col_idx, val in enumerate(values, start=1):
+            ws.cell(row=excel_row, column=col_idx, value=val)
+        action_desc = f"{'Inserted' if plan['action'] == 'insert' else 'Appended'} weekly row at {excel_row}"
+
+    wb.save(output_path)
+    return action_desc
+
+
+def write_weekly_summary_row_google(store_tab: str, sunday_date: date, row_data: dict) -> str:
+    if not USE_GOOGLE:
+        raise RuntimeError("Google credentials not configured.")
+
+    label = _weekly_label(sunday_date)
+
+    # Read column B
+    result = _sheets_service.values().get(
+        spreadsheetId=_SHEET_ID,
+        range=f"'{store_tab}'!B:B",
+    ).execute()
+    col_b = result.get("values", [])
+
+    date_col_values = [(i, (row[0] if row else None)) for i, row in enumerate(col_b)]
+
+    plan = _plan_weekly_row(date_col_values, sunday_date)
+    values = _row_data_to_list(row_data, label)
+    values_2d = [values]
+    excel_row = plan["row_index"] + 1
+
+    if plan["action"] == "overwrite":
+        _sheets_service.values().update(
+            spreadsheetId=_SHEET_ID,
+            range=f"'{store_tab}'!A{excel_row}",
+            valueInputOption="USER_ENTERED",
+            body={"values": values_2d},
+        ).execute()
+        return f"Overwrote weekly row {excel_row}"
+
+    sheet_id = _get_sheet_id_by_name(store_tab)
+    if plan["action"] == "insert":
+        _sheets_service.batchUpdate(
+            spreadsheetId=_SHEET_ID,
+            body={
+                "requests": [{
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": excel_row - 1,
+                            "endIndex": excel_row,
+                        },
+                        "inheritFromBefore": True,
+                    }
+                }]
+            },
+        ).execute()
+
+    _sheets_service.values().update(
+        spreadsheetId=_SHEET_ID,
+        range=f"'{store_tab}'!A{excel_row}",
+        valueInputOption="USER_ENTERED",
+        body={"values": values_2d},
+    ).execute()
+    return f"{'Inserted' if plan['action'] == 'insert' else 'Appended'} weekly row at {excel_row}"
+
+
+def write_weekly_summary_row(store_tab: str, sunday_date: date, row_data: dict, output_path: Path = None) -> str:
+    """
+    Insert/overwrite a 'Week ending D/M/YY' summary row immediately after
+    the corresponding Sunday daily row. Uses the same column layout as a
+    daily row — only column B differs (label instead of date string).
+    """
+    if USE_GOOGLE:
+        return write_weekly_summary_row_google(store_tab, sunday_date, row_data)
+    else:
+        return write_weekly_summary_row_local(store_tab, sunday_date, row_data, output_path=output_path)
 
 
 # ---------------------------------------------------------------------------

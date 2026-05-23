@@ -16,18 +16,21 @@ Owner: Ruitan Huang — 7 franchise stores in Perth, WA.
 # Install dependencies
 pip install -r requirements.txt
 
-# Test PDF extraction against sample PDFs (primary development task)
+# Test PDF extraction against sample PDFs — runs two assertions (Week Total + Mon 13/04)
 python pdf_extractor.py
 
-# Test Sheets writer against a copy of the scorecard
+# Test Sheets writer against a copy of the scorecard (writes test_output.xlsx)
 python sheets_writer.py
 
-# Run the full pipeline manually (requires secrets in env)
+# Run the full pipeline for yesterday (default) or a specific date (backfill)
 python main.py
+python main.py 2026-04-13
 
 # Run GitHub Actions workflow manually (once deployed)
 gh workflow run daily_run.yml
 ```
+
+Each module (`gmail_fetch.py`, `sheets_writer.py`, `alerter.py`) also has a `__main__` block for standalone testing.
 
 ---
 
@@ -38,16 +41,24 @@ Five modules wired together by `main.py`:
 | File | Role |
 |------|------|
 | `gmail_fetch.py` | Gmail API (OAuth2) — fetches emails by sender, downloads PDF attachments |
-| `pdf_extractor.py` | pypdf text extraction → Claude API (Haiku) → structured JSON |
+| `pdf_extractor.py` | pdfplumber text extraction → regex parsing → structured dict |
 | `sheets_writer.py` | Google Sheets API v4 — finds the right row by date, writes data |
-| `alerter.py` | Sends alert email if any store/report fails; never aborts the whole run |
-| `config.py` | Store config, sender emails, field→column mappings |
+| `alerter.py` | Collects issues throughout the run, sends one digest email at the end |
+| `config.py` | Store config, sender emails, field→column mappings, scorecard layout constants |
 
-**PDF extraction pattern:** Extract raw text with pypdf/pdfplumber first, then pass text (not base64) to Claude API with a strict JSON-only prompt. This is cheaper and more reliable than sending the raw PDF.
+**PDF extraction pattern:** Extract raw text with pdfplumber (0-based page indices), then parse with regex. No external API call — extraction is pure Python regex. `extract_all()` in `pdf_extractor.py` is the top-level function that merges DDCR + Sales Ledger + QCR Daily into a single scorecard row dict.
+
+**Dual-backend pattern (all three I/O modules):** Backend is auto-selected from env vars at import time — there is no CLI flag to switch.
+
+| Module | Local/dev mode | Production mode trigger |
+|--------|---------------|------------------------|
+| `gmail_fetch.py` | Returns paths from `Sample report/` dir; all PDFs mapped to William St only | `GMAIL_OAUTH_CREDENTIALS` + `GMAIL_TOKEN` both set |
+| `sheets_writer.py` | Reads/writes `Weekly Scorecard tracker Q2 2026.xlsx` directly via openpyxl | `GOOGLE_SHEETS_SERVICE_ACCOUNT` + `SCORECARD_SHEET_ID` both set |
+| `alerter.py` | Prints digest to stdout | `ALERT_EMAIL` + `SMTP_USER` + `SMTP_PASS` all set |
 
 **Store identification:** Each store's emails come from a unique sender address. `config.py` maps sender → store name → sheet tab name.
 
-**Row targeting in Sheets:** The date column is **Excel column B** (column A is always blank). Search column B of the relevant sheet for a cell matching today's date (`D/M/YY` or `DD/MM/YY`). Overwrite if found; if not found, insert a new row within the correct month block (before the "Monthend: [Month]" row).
+**Row targeting in Sheets:** The date column is **Excel column B** (column A is always blank). Search column B of the relevant sheet for a cell matching the target date. Overwrite if found; insert before the "Monthend: [Month]" row if not found; append after the last non-empty row as a fallback.
 
 ---
 
@@ -56,9 +67,14 @@ Five modules wired together by `main.py`:
 The scorecard was originally weekly (one row per week-ending Sunday). It is being redesigned to **daily granularity**:
 
 - **Reports:** The DDCR is a **weekly-format PDF** (Mon–Sun columns + Week Total). The same file is sent by managers every day; only the current day's column has data — prior days accumulate as the week progresses.
-- **Scorecard rows:** Each day gets its own row. The week-ending Sunday row doubles as the weekly summary (all 7 day columns and the Week Total are all populated). The existing "Monthend" row stays as a monthly aggregate.
+- **Scorecard rows:** Each day gets its own row containing that day's daily values. The existing "Monthend" row stays as a monthly aggregate.
+- **Sunday rows + Week Total summary:** On Sundays, the script writes TWO rows:
+    1. The Sunday daily row (same as any weekday) — column B = `19/4/26`
+    2. A `Week ending 19/4/26` summary row immediately after, populated from the DDCR **Week Total column** + Sales Ledger **Week Tot** row + QCR — column B = literal text `"Week ending D/M/YY"`
+  This is implemented by `sheets_writer.write_weekly_summary_row()` and triggered in `main.py` when `target_date.weekday() == 6`.
 - **Schedule:** The script runs **every morning** to process the previous day's report.
-- **Daily extraction:** To extract a specific day's data from the DDCR, match the date column header (format `DD/MM/YYYY` e.g. `13/04/2026`). Do not use the "Week Total" column for daily rows.
+- **Daily extraction:** To extract a specific day's data from the DDCR, match the date column header (format `DD/MM/YYYY` e.g. `13/04/2026`). The "Week Total" column is reserved for the weekly summary row.
+- **Weekly-row finder caveat:** `_cell_matches_date()` in `sheets_writer.py` explicitly **skips** rows whose column B starts with `"Week ending "`. This prevents a future daily run from accidentally overwriting the weekly summary row. Any new row-finder logic must respect this.
 
 ---
 
@@ -90,7 +106,7 @@ Each row is a metric. Confirmed field names (exact text as it appears in the PDF
 | `Proj GCPCH` | QCPM | Numeric — confirm this mapping |
 | `Total Waste %` | Waste combined | Decimal e.g. `0.50%` → 0.005 |
 | `Cash + / -` | Cash + / - | Dollar value; negative shown as `($25.14)` |
-| `SOC Percent` | STA % | e.g. `100.00%` |
+| `SOC Percent` | STA % | Stored in PDF as plain `100.00` (no `%`); extractor normalises to decimal by ÷100 |
 
 **Fields confirmed NOT in the DDCR:** Training Hours, KVS, R2P, Side 2, Delivery Time, Sick hours, Refund, Promo, Manager Meal.
 
@@ -100,28 +116,30 @@ Also present in DDCR but not mapped to scorecard: `Projected Guest Count`, `Gues
 
 ### Sales Ledger — `Sales Ledger Month Apr 26.pdf`
 
-**4 pages.** Monthly cumulative report; rows are individual calendar days.
+**4 pages** (pdfplumber page indices 0–3). Monthly cumulative report; rows are individual calendar days.
 
-- **Page 1:** Each day row contains: `ORing`, `Refund` (qty + amt), `EFT Refunds` (qty + amt), `Other Receipts`, `GC Sold`, `Gross Sales`, tax columns, `Guest Count`, `Ave Chk`
-- **Page 2:** Cash/Eftpos reconciliation columns per day
-- **Page 3:** Promo/meals breakdown per day — columns include `Disc Sales`, `Promo Sales Amt`, `Emp Meals Amt`, `Mgr Meals Amt`, `Other Net Sales`
-- **Page 4:** (continuation)
+- **Page 0 (PDF p.1):** Each day row contains: `ORing`, `Refund` (qty + amt), `EFT Refunds` (qty + amt), `Other Receipts`, `GC Sold`, `Gross Sales`, tax columns, `Guest Count`, `Ave Chk`
+- **Page 1 (PDF p.2):** Cash/Eftpos reconciliation columns per day
+- **Page 2 (PDF p.3):** Promo/meals breakdown per day — columns include `Disc Sales`, `Promo Sales Amt`, `Emp Meals Amt`, `Mgr Meals Amt`, `Other Net Sales`
+- **Page 3 (PDF p.4):** (continuation)
 
 **Extraction targets (per day row, matched by day number e.g. `13 Mon`):**
 
-| PDF location | PDF field | Scorecard field |
-|---|---|---|
-| Page 1, `EFT Refunds` Amt column | e.g. `21.50` | Refund |
-| Page 3, `Promo Sales Amt` column | e.g. `838.05` | Promo |
-| Page 3, `Mgr Meals Amt` column | e.g. `160.68` | Manager Meal |
+| pdfplumber page | Token index | PDF field | Scorecard field |
+|---|---|---|---|
+| 0 | [8] | `EFT Refunds` Amt | Refund |
+| 2 | [3] | `Promo Sales Amt` | Promo |
+| 2 | [9] | `Mgr Meals Amt` | Manager Meal |
 
-> ⚠️ The user indicated Refund/Promo/Manager Meal come from the daily DDCR. However in the sample PDFs these fields appear only in the Sales Ledger (page 3). Confirm exact source once daily PDFs are available. For now, extract from Sales Ledger.
+Week-total rows (`Week Tot`) use different token offsets — see comments in `extract_sales_ledger()`.
+
+> ⚠️ The user indicated Refund/Promo/Manager Meal come from the daily DDCR. However in the sample PDFs these fields appear only in the Sales Ledger. Confirm exact source once daily PDFs are available. For now, extract from Sales Ledger.
 
 ---
 
 ### QCR Daily — `QCR Daily 19Apr26.pdf`
 
-**13 pages.** Pages 1–12 are item-level food/paper cost detail (one row per menu item). **Page 13 (last page) is the summary** — this is the only page needed.
+**13 pages.** Pages 1–12 are item-level food/paper cost detail (one row per menu item). **Last page (index -1) is the summary** — this is the only page needed.
 
 Key fields on the summary page:
 
@@ -164,7 +182,7 @@ Monthend: [Month]       ← monthly aggregate row
                         ← blank separator
 ```
 
-**Date format in column B:** Mixed — some stored as Excel date objects (pandas reads as `YYYY-DD-MM HH:MM:SS`), some as text strings (`D/M/YY` e.g. `19/4/26`). Sheets writer must handle both when searching for a row. Write new rows as text `D/M/YY`.
+**Date format in column B:** Mixed — some cells are Excel date objects (openpyxl returns `datetime`), some are text strings (`D/M/YY` e.g. `19/4/26`). Some dates were entered in a US-locale Excel and have day/month swapped; `_cell_matches_date()` in `sheets_writer.py` handles all these cases. Write new rows as text `D/M/YY`.
 
 ---
 
@@ -172,7 +190,7 @@ Monthend: [Month]       ← monthly aggregate row
 
 **⚠️ Column A in Excel is always blank.** W/End dates are in **column B**. KPI data starts at **column C**.
 
-| Excel Col | pandas idx | Field | Source | Notes |
+| Excel Col | col_index | Field | Source | Notes |
 |-----------|-----------|-------|--------|-------|
 | A | 0 | *(blank)* | — | Always empty — do not write here |
 | B | 1 | W/End date | — | `D/M/YY` e.g. `19/4/26` |
@@ -189,7 +207,7 @@ Monthend: [Month]       ← monthly aggregate row
 | M | 12 | Actual Hours | DDCR | `Actual Crew Hours` |
 | N | 13 | Labour Actual | DDCR | `Actual Total Labour %` — decimal |
 | O | 14 | Training Hours | ⚠ UNKNOWN | Not in sample DDCR — confirm source |
-| P | 15 | STA % | DDCR | `SOC Percent` |
+| P | 15 | STA % | DDCR | `SOC Percent` — stored as 100.00, written as decimal 1.00 |
 | Q | 16 | ACPM | DDCR | `Actual GCPCH` |
 | R | 17 | QCPM | DDCR | `Proj GCPCH` — confirm this mapping |
 | S | 18 | KVS Peak | ⚠ UNKNOWN | Not in any sample report |
@@ -199,9 +217,9 @@ Monthend: [Month]       ← monthly aggregate row
 | W | 22 | Side 2 Peak | ⚠ UNKNOWN | Not in any sample report |
 | X | 23 | Side 2 Shift | ⚠ UNKNOWN | Not in any sample report |
 | Y | 24 | Delivery Time | ⚠ UNKNOWN | Not in any sample report |
-| Z | 25 | Refund | Sales Ledger p1 | `EFT Refunds` Amt per day row |
-| AA | 26 | Promo | Sales Ledger p3 | `Promo Sales Amt` per day row |
-| AB | 27 | Manager Meal | Sales Ledger p3 | `Mgr Meals Amt` per day row |
+| Z | 25 | Refund | Sales Ledger p0 | `EFT Refunds` Amt per day row |
+| AA | 26 | Promo | Sales Ledger p2 | `Promo Sales Amt` per day row |
+| AB | 27 | Manager Meal | Sales Ledger p2 | `Mgr Meals Amt` per day row |
 | AC | 28 | Ros Mgr Hours | DDCR | `Projected Crew Hours` ⚠ confirm if crew or mgr-only |
 | AD | 29 | Actual Mgr hrs | ⚠ UNKNOWN | Not confirmed in sample reports |
 | AE | 30 | Sick Mgr Hr | ⚠ UNKNOWN | Not in any sample report |
@@ -216,7 +234,7 @@ Monthend: [Month]       ← monthly aggregate row
 - Col AD: Actual Mgr hrs
 - Cols AE–AF: Sick Mgr Hr, Sick Crew Hrs
 
-**Extra columns:** The store tabs have 37 columns total (2 unlabelled beyond AI, pandas idx 35–36). Do not overwrite these.
+**Extra columns:** The store tabs have 37 columns total (2 unlabelled beyond AI, col_index 35–36). Do not overwrite these.
 
 ---
 
@@ -238,6 +256,8 @@ Monthend: [Month]       ← monthly aggregate row
 
 Real PDFs for William St in `Sample report/`. The DDCR covers the full week 13–19 Apr 2026. Use the **Week Total column** values to validate weekly extraction; use individual **day columns** to validate daily extraction.
 
+Running `python pdf_extractor.py` checks both scenarios automatically and prints PASS/FAIL per field.
+
 **DDCR — Week Total column (week ending 19/4/26):**
 
 | PDF field | Expected value |
@@ -257,7 +277,7 @@ Real PDFs for William St in `Sample report/`. The DDCR covers the full week 13�
 | Proj GCPCH | 10.37 |
 | Total Waste % | 0.28% |
 | Cash + / - | ($17.49) |
-| SOC Percent | 100.00 |
+| SOC Percent | 100.00 → stored as 1.00 |
 
 **DDCR — Monday 13/04/2026 column (daily example):**
 
@@ -272,17 +292,17 @@ Real PDFs for William St in `Sample report/`. The DDCR covers the full week 13�
 | Total Waste % | 0.50% |
 | Actual Crew SPCH | $146.88 |
 
-**Sales Ledger — week of 13–19 Apr (page 3):**
+**Sales Ledger — week of 13–19 Apr:**
 
 | Field | Weekly total | Source |
 |-------|-------------|--------|
-| EFT Refunds Amt | $140.95 | Page 1 Week Tot |
-| Promo Sales Amt | $6,422.12 | Page 3 Week Tot |
-| Mgr Meals Amt | $625.09 | Page 3 Week Tot |
+| EFT Refunds Amt | $140.95 | Page 0 (PDF p.1) Week Tot |
+| Promo Sales Amt | $6,422.12 | Page 2 (PDF p.3) Week Tot |
+| Mgr Meals Amt | $625.09 | Page 2 (PDF p.3) Week Tot |
 
 **QCR Daily (Sunday 19 Apr only):** QCR % of Product Sold = **25.99%** (0.2599)
 
-> Note: CLAUDE.md previously listed QCR = 26.64% — that figure may be from the weekly QCR Progressive report, not the single-day QCR Daily. Clarify which is correct for the scorecard.
+> Note: 26.64% may be from the weekly QCR Progressive report, not the single-day QCR Daily. Clarify which is correct for the scorecard.
 
 ---
 
@@ -304,8 +324,15 @@ GMAIL_OAUTH_CREDENTIALS       # OAuth2 client credentials JSON
 GMAIL_TOKEN                   # OAuth2 token JSON (after first auth)
 GOOGLE_SHEETS_SERVICE_ACCOUNT # Service account JSON
 SCORECARD_SHEET_ID            # Sheet ID from the URL
-ANTHROPIC_API_KEY             # Claude API key
 ALERT_EMAIL                   # Address to send failure alerts to
+SMTP_USER                     # Gmail address for sending alert emails
+SMTP_PASS                     # App password for SMTP_USER
+```
+
+Optional overrides (defaults to Gmail SMTP):
+```
+SMTP_HOST   # default: smtp.gmail.com
+SMTP_PORT   # default: 587
 ```
 
 ---
@@ -317,11 +344,9 @@ ALERT_EMAIL                   # Address to send failure alerts to
 3. Confirm source for: Training Hours (col O), KVS/R2P/Side 2/Delivery Time (cols S–Y), Actual Mgr hrs (col AD), Sick hours (cols AE–AF)
 4. Confirm whether Refund/Promo/Manager Meal are in the daily DDCR or daily Sales Ledger (sample PDFs show Sales Ledger; confirm with actual daily PDF)
 5. Confirm whether QCR % for daily scorecard uses QCR Daily (single day) or QCR Progressive (period-to-date)
-6. Build and test `pdf_extractor.py` against sample PDFs — verify against known values above
-7. Build and test `sheets_writer.py` against a copy of the scorecard (daily row insertion logic)
-8. Build `gmail_fetch.py` — test Gmail auth and PDF download
-9. Wire together in `main.py`
-10. Build `alerter.py`
-11. Set up GitHub Actions and secrets
-12. First live test via `workflow_dispatch`
-13. Confirm daily auto-trigger
+6. Verify `pdf_extractor.py` passes against sample PDFs: `python pdf_extractor.py`
+7. Verify `sheets_writer.py` produces correct `test_output.xlsx`: `python sheets_writer.py`
+8. Confirm Gmail auth works: set env vars and run `python gmail_fetch.py`
+9. Set up GitHub Actions and secrets
+10. First live test via `workflow_dispatch`
+11. Confirm daily auto-trigger
