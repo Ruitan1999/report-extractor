@@ -112,6 +112,9 @@ def run(target_date: date = None):
             alerter.record_issue(name, "sheets", f"Write failed: {e}")
             print(f"  [ERROR] Write failed: {e}")
 
+        # Record this store's KPIs for the daily digest email
+        alerter.record_store_result(name, row_data)
+
         # If this is a Sunday, also write a 'Week ending D/M/YY' summary row
         # containing the DDCR Week Total column + Sales Ledger Week Tot row
         if target_date.weekday() == 6:  # Monday=0 ... Sunday=6

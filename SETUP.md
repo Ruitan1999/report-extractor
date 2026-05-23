@@ -60,9 +60,17 @@ To switch to the real production sheet:
 
 ---
 
-### 3. Email alerts (optional — alerts currently only in Actions logs)
+### 3. Daily digest email (optional — alerts/data currently only in Actions logs)
 
-Right now if something fails, you only see it by opening the [Actions tab](https://github.com/Ruitan1999/report-extractor/actions) and reading the run log. To get failure alerts in your inbox, add 3 more GitHub secrets:
+When SMTP secrets are configured, after every run the script sends ONE email containing:
+- **KPI summary table** — one row per store, columns: Projected Sales, Actual Sales, Sales Comp, Sales Proj Opp, GC Comp, Cash +/-, Waste, Labour Proj, SPCH, AHR
+- **Issues list** — any stores that failed to extract or write
+
+Subject line: `Daily Store Report — 2026-04-13 (1 OK, 6 issues)`
+
+Without SMTP secrets, this same digest is printed to the Actions run log only.
+
+To enable email, add 3 GitHub secrets:
 
 | Secret | Value |
 |---|---|
